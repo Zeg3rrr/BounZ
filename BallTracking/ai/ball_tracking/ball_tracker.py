@@ -163,7 +163,7 @@ def draw_tracking_overlay(
     """Draw the video overlay with tracking information."""
     cv2.putText(
         frame,
-        f"BounZ Ball Tracking",
+        "BounZ Ball Tracking",
         (10, 30),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.7,
@@ -171,7 +171,6 @@ def draw_tracking_overlay(
         2,
     )
     cv2.putText(
-        frame,
         f"FPS: {fps:.1f}",
         (10, 60),
         cv2.FONT_HERSHEY_SIMPLEX,
@@ -179,12 +178,27 @@ def draw_tracking_overlay(
         (255, 255, 255),
         2,
     )
+    cv2.putText(
+        "AI model: YOLOv8",
+        (10, 90),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (255, 255, 255),
+        2,
+    )
 
     if detection is None:
         cv2.putText(
-            frame,
             "Basketball: NOT DETECTED",
-            (10, 95),
+            (10, 120),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 0, 255),
+            2,
+        )
+        cv2.putText(
+            "Tracking: SEARCHING",
+            (10, 150),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
             (0, 0, 255),
@@ -201,7 +215,7 @@ def draw_tracking_overlay(
         cv2.putText(
             frame,
             f"Basketball: {class_name} {confidence:.2f}",
-            (10, 95),
+            (10, 120),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
             (0, 255, 0),
@@ -210,10 +224,19 @@ def draw_tracking_overlay(
         cv2.putText(
             frame,
             f"Ball: ({center_x}, {center_y})",
-            (10, 125),
+            (10, 150),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
             (255, 255, 255),
+            2,
+        )
+        cv2.putText(
+            frame,
+            "Tracking: ACTIVE",
+            (10, 180),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 0),
             2,
         )
 
