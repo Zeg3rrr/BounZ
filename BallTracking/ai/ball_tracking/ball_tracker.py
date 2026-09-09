@@ -171,6 +171,7 @@ def draw_tracking_overlay(
         2,
     )
     cv2.putText(
+        frame,
         f"FPS: {fps:.1f}",
         (10, 60),
         cv2.FONT_HERSHEY_SIMPLEX,
@@ -179,6 +180,7 @@ def draw_tracking_overlay(
         2,
     )
     cv2.putText(
+        frame,
         "AI model: YOLOv8",
         (10, 90),
         cv2.FONT_HERSHEY_SIMPLEX,
@@ -189,6 +191,7 @@ def draw_tracking_overlay(
 
     if detection is None:
         cv2.putText(
+            frame,
             "Basketball: NOT DETECTED",
             (10, 120),
             cv2.FONT_HERSHEY_SIMPLEX,
@@ -197,6 +200,7 @@ def draw_tracking_overlay(
             2,
         )
         cv2.putText(
+            frame,
             "Tracking: SEARCHING",
             (10, 150),
             cv2.FONT_HERSHEY_SIMPLEX,
@@ -280,6 +284,7 @@ def main() -> int:
 
     trail: deque[tuple[int, int]] = deque(maxlen=trail_length)
     last_time = time.time()
+    last_detection_status: Optional[bool] = None
 
     try:
         while True:
@@ -289,6 +294,19 @@ def main() -> int:
                 return 1
 
             detection = detect_ball(frame, model, confidence_threshold)
+            current_detection_status = detection is not None
+            if current_detection_status != last_detection_status:
+                if current_detection_status:
+                    assert detection is not None
+                    print(
+                        f"Ball detected: {detection['class_name']} "
+                        f"confidence={detection['confidence']:.2f} "
+                        f"center={detection['center']}"
+                    )
+                else:
+                    print("Ball not detected. Searching...")
+                last_detection_status = current_detection_status
+
             if detection is not None:
                 trail.append(detection["center"])
             else:
