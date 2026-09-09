@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 import time
 from collections import deque
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple, TypedDict
 
 import cv2
 import numpy as np
@@ -17,8 +18,16 @@ CAMERA_INDEX = 0
 CONFIDENCE_THRESHOLD = 0.5
 TRAIL_LENGTH = 20
 WINDOW_NAME = "BounZ Ball Tracking"
+DEFAULT_MODEL_NAME = "yolov8n.pt"
 
 BALL_CLASS_NAMES = {"basketball", "sports ball", "ball"}
+
+
+class Detection(TypedDict):
+    class_name: str
+    confidence: float
+    bbox: tuple[int, int, int, int]
+    center: tuple[int, int]
 
 
 def get_model_path() -> Optional[Path]:
@@ -40,7 +49,7 @@ def get_model_path() -> Optional[Path]:
     return None
 
 
-def load_model() -> YOLO:
+def load_model(model_name: str = DEFAULT_MODEL_NAME) -> YOLO:
     """Load a local YOLO model if available, otherwise use the standard YOLOv8 weights."""
     model_path = get_model_path()
 
@@ -51,13 +60,44 @@ def load_model() -> YOLO:
         except Exception as exc:
             raise RuntimeError(f"Could not load the local model: {model_path}. Error: {exc}") from exc
 
-    print("No local model found. Downloading the default YOLOv8 Nano model for the first prototype.")
+    print(f"No local model found. Downloading the default YOLO model: {model_name}")
     try:
-        return YOLO("yolov8n.pt")
+        return YOLO(model_name)
     except Exception as exc:
         raise RuntimeError(
             "Could not load the YOLO model. Check your internet connection and Ultralytics installation."
         ) from exc
+
+
+def open_camera(camera_index: int) -> cv2.VideoCapture:
+    """Open a webcam using a Windows-friendly fallback strategy."""
+    camera_candidates: list[int] = [camera_index, 0, 1, 2]
+    seen: set[int] = set()
+    for index in camera_candidates:
+        if index in seen:
+            continue
+        seen.add(index)
+
+        cap = None
+        try:
+            if hasattr(cv2, "CAP_DSHOW"):
+                cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+            else:
+                cap = cv2.VideoCapture(index)
+        except Exception:
+            cap = None
+
+        if cap is not None and cap.isOpened():
+            print(f"Webcam opened successfully on camera index {index}.")
+            return cap
+
+        if cap is not None:
+            cap.release()
+
+    raise RuntimeError(
+        f"Could not open webcam. Check camera permissions or CAMERA_INDEX={camera_index}. "
+        "Try another index or close other apps using the camera."
+    )
 
 
 def normalize_class_name(class_name: str) -> str:
@@ -77,14 +117,14 @@ def calculate_fps(last_time: float) -> Tuple[float, float]:
     return fps, current_time
 
 
-def detect_ball(frame: np.ndarray, model: YOLO, confidence_threshold: float) -> Optional[dict]:
+def detect_ball(frame: np.ndarray, model: YOLO, confidence_threshold: float) -> Optional[Detection]:
     """Run YOLO on a frame and return the best basketball detection."""
-    results = model(frame, verbose=False, conf=confidence_threshold)
-    if not results or len(results) == 0:
+    raw_results: Any = model(frame, verbose=False, conf=confidence_threshold)
+    if not raw_results or len(raw_results) == 0:
         return None
 
-    result = results[0]
-    best_match: Optional[dict] = None
+    result: Any = raw_results[0]
+    best_match: Optional[Detection] = None
 
     for box in result.boxes:
         class_id = int(box.cls[0])
@@ -101,7 +141,7 @@ def detect_ball(frame: np.ndarray, model: YOLO, confidence_threshold: float) -> 
         center_x = (x1 + x2) / 2
         center_y = (y1 + y2) / 2
 
-        detection = {
+        detection: Detection = {
             "class_name": class_name,
             "confidence": confidence,
             "bbox": (int(x1), int(y1), int(x2), int(y2)),
@@ -116,8 +156,8 @@ def detect_ball(frame: np.ndarray, model: YOLO, confidence_threshold: float) -> 
 
 def draw_tracking_overlay(
     frame: np.ndarray,
-    detection: Optional[dict],
-    trail: deque,
+    detection: Optional[Detection],
+    trail: deque[tuple[int, int]],
     fps: float,
 ) -> None:
     """Draw the video overlay with tracking information."""
@@ -185,30 +225,47 @@ def draw_tracking_overlay(
             cv2.line(frame, pt1, pt2, (255, 140, 0), 2)
 
 
+def parse_arguments() -> argparse.Namespace:
+    """Parse command-line arguments for beginner-friendly configuration."""
+    parser = argparse.ArgumentParser(description="BounZ live basketball tracking")
+    parser.add_argument("--camera-index", type=int, default=CAMERA_INDEX, help="Camera index to open (0, 1, 2, etc.)")
+    parser.add_argument("--confidence", type=float, default=CONFIDENCE_THRESHOLD, help="YOLO confidence threshold")
+    parser.add_argument("--trail-length", type=int, default=TRAIL_LENGTH, help="Number of positions kept in the movement trail")
+    parser.add_argument("--model-name", type=str, default=DEFAULT_MODEL_NAME, help="YOLO model to load, e.g. yolov8n.pt")
+    return parser.parse_args()
+
+
 def main() -> int:
     """Open the webcam, detect a basketball, and show the live tracking overlay."""
+    args = parse_arguments()
+    camera_index = args.camera_index
+    confidence_threshold = args.confidence
+    trail_length = args.trail_length
+    model_name = args.model_name
+
     try:
-        model = load_model()
+        model = load_model(model_name)
     except Exception as exc:
         print(f"Model error: {exc}")
         return 1
 
-    cap = cv2.VideoCapture(CAMERA_INDEX)
-    if not cap.isOpened():
-        print(f"Could not open webcam. Check camera permissions or CAMERA_INDEX={CAMERA_INDEX}.")
+    try:
+        cap = open_camera(camera_index)
+    except Exception as exc:
+        print(str(exc))
         return 1
 
-    trail: deque[tuple[int, int]] = deque(maxlen=TRAIL_LENGTH)
+    trail: deque[tuple[int, int]] = deque(maxlen=trail_length)
     last_time = time.time()
 
     try:
         while True:
             success, frame = cap.read()
-            if not success or frame is None:
+            if not success:
                 print("Webcam is open, but no frames are being received. Check the camera connection.")
                 return 1
 
-            detection = detect_ball(frame, model, CONFIDENCE_THRESHOLD)
+            detection = detect_ball(frame, model, confidence_threshold)
             if detection is not None:
                 trail.append(detection["center"])
             else:
