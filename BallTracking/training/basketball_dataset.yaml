@@ -1,0 +1,10 @@
+# Dataset configuration for a two-class BounZ detector.
+# Paths are relative to this YAML file.
+path: ../data/dataset
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: basketball
+  1: hoop

@@ -8,3 +8,28 @@ __pycache__/
 .DS_Store
 Thumbs.db
 ai/ball_tracking/models/*.pt
+
+# Training assets and generated YOLO results. The .gitkeep exceptions preserve
+# the empty project folders without committing videos, images or labels.
+data/raw_videos/*
+!data/raw_videos/.gitkeep
+data/frames/*
+!data/frames/.gitkeep
+data/annotated/images/*
+!data/annotated/images/.gitkeep
+data/annotated/labels/*
+!data/annotated/labels/.gitkeep
+data/dataset/images/train/*
+!data/dataset/images/train/.gitkeep
+data/dataset/images/val/*
+!data/dataset/images/val/.gitkeep
+data/dataset/images/test/*
+!data/dataset/images/test/.gitkeep
+data/dataset/labels/train/*
+!data/dataset/labels/train/.gitkeep
+data/dataset/labels/val/*
+!data/dataset/labels/val/.gitkeep
+data/dataset/labels/test/*
+!data/dataset/labels/test/.gitkeep
+runs/*
+!runs/.gitkeep

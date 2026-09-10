@@ -1,0 +1,2 @@
+# Large local model downloads are not source code.
+*.pt
