@@ -2,6 +2,8 @@
 
 Ja: internetvideo's kunnen bruikbaar trainingsmateriaal zijn, maar alleen als je ze mag downloaden en hergebruiken. Gebruik bij voorkeur eigen opnames, Creative Commons-video's, materiaal met expliciete toestemming of een dataset waarvan de licentie training toelaat. Sla steeds de bron en licentie op in een klein tekstbestand naast de video. Download geen video's waarvan de gebruiksvoorwaarden dit verbieden.
 
+Er staan al twee lokaal gedownloade, vrije Pexels-startclips in `data/raw_videos/`: één met spelers/bal/ring en één met een binnenzaal/ringen. Zie [DATA_SOURCES.md](DATA_SOURCES.md) voor de exacte pagina's, makers en downloadmoment. Gebruik deze als aanvulling; je eigen schoolbeelden zijn belangrijker omdat camera, licht en achtergrond dan overeenkomen met je echte test.
+
 Een YOLO-model leert niet rechtstreeks uit een video. De keten is:
 
 ```text
@@ -11,14 +13,15 @@ legale video -> losse frames -> bounding boxes labelen -> dataset splitsen
 
 ## 1. Kies wat het model moet herkennen
 
-Dit project gebruikt twee klassen. Gebruik deze namen en nummers overal identiek:
+Dit project gebruikt drie klassen. Gebruik deze namen en nummers overal identiek:
 
 | Nummer | Klasse | Wat teken je af? |
 | --- | --- | --- |
 | `0` | `basketball` | De zichtbare bal, ook als hij deels door een hand of net bedekt is. |
 | `1` | `hoop` | De volledige ring; gebruik consequent dezelfde interpretatie. |
+| `2` | `white_ping_pong_ball` | Een witte pingpongbal; uitsluitend voor de trackingtest op school. |
 
-Een pingpongbal mag je gebruiken om de tracking te testen, maar label hem **niet** als `basketball` wanneer je een echte basketbal-detector wilt. Maak dan eventueel een apart drieklassen-project met `ping_pong_ball` als klasse `2`.
+Label een pingpongbal dus **niet** als `basketball`. De live tracker toont hem als `WHITE PINGPONG` in cyaan en telt hem niet als basketbalpoging.
 
 ## 2. Verzamel gevarieerde video
 
@@ -33,7 +36,20 @@ Gebruik 5–15 korte clips en kies beelden die lijken op je schoolopstelling:
 
 Neem niet iedere frame uit een video: opeenvolgende beelden lijken bijna volledig op elkaar. Ongeveer 500–1.500 gevarieerde, gelabelde beelden is een sterk eerste doel. Houd hele clips apart voor validatie/test; splits nooit willekeurige opeenvolgende frames uit dezelfde clip over train en test, want dat maakt de score te optimistisch.
 
-Plaats de originele video's lokaal in `data/raw_videos/`. Die map wordt bewust niet naar GitHub gepusht.
+Plaats je eigen video's lokaal in `data/raw_videos/`. Die map wordt bewust niet naar GitHub gepusht. Gebruik duidelijke bestandsnamen, bijvoorbeeld `school_pingpong_donker_01.mp4` en `school_basketbal_ring_01.mp4`.
+
+### Opnameplan voor de witte pingpongbal op school
+
+Maak minstens zes clips van 20–40 seconden met dezelfde webcam die je later voor BounZ gebruikt:
+
+1. witte bal voor een donkere achtergrond, langzaam rollen;
+2. witte bal voor een lichte achtergrond, langzaam rollen;
+3. bal gooien met normale snelheid;
+4. bal kort bedekt door hand of tafelrand;
+5. camera verder weg, zodat de bal klein is;
+6. lege scènes zonder bal (negatieve voorbeelden).
+
+Maak daarnaast basketbalclips met de ring zichtbaar. Meng bij het labelen beelden uit de twee Pexels-clips én je eigen clips, maar houd ten minste één volledige eigen clip apart voor de uiteindelijke test.
 
 ## 3. Maak frames uit een video
 
@@ -50,7 +66,7 @@ Bij 30 fps betekent `--every 15` ongeveer twee beelden per seconde. Gebruik voor
 
 ## 4. Label elke zichtbare bal en ring
 
-Gebruik bijvoorbeeld CVAT, Roboflow Annotate of Label Studio. Importeer de gekozen JPEG-bestanden en maak de klassen in exact deze volgorde: `basketball`, daarna `hoop`.
+Gebruik bijvoorbeeld CVAT, Roboflow Annotate of Label Studio. Importeer de gekozen JPEG-bestanden en maak de klassen in exact deze volgorde: `basketball`, `hoop`, `white_ping_pong_ball`.
 
 Teken een zo strak mogelijke rechthoek rond elk object. Een labelbestand in YOLO-formaat heeft dezelfde naam als de afbeelding:
 
@@ -64,6 +80,7 @@ Een regel in `frame_00042.txt` ziet er zo uit:
 ```text
 0 0.512500 0.395833 0.062500 0.083333
 1 0.486000 0.221000 0.180000 0.090000
+2 0.210000 0.660000 0.030000 0.040000
 ```
 
 Dit betekent `klasse x_middelpunt y_middelpunt breedte hoogte`, waarbij de vier coördinaten tussen 0 en 1 liggen. Exporteer dus als **Ultralytics YOLO / YOLO**. Kopieer de geëxporteerde afbeeldingen naar `data/annotated/images/` en de `.txt`-bestanden naar `data/annotated/labels/`.
@@ -111,7 +128,7 @@ $env:BOUNZ_MODEL_PATH = "$PWD\BallTracking\runs\basketball_detector\weights\best
 .\.venv\Scripts\python.exe BallTracking\ai\ball_tracking\ball_tracker.py
 ```
 
-De live tracker verwacht de klassenamen `basketball` en `hoop` (ook `basketball hoop` en `rim` worden voor de ring aanvaard). Je eigen YAML gebruikt daarom exact `basketball` en `hoop`.
+De live tracker verwacht de klassenamen `basketball`, `hoop` en `white_ping_pong_ball`. Ook `basketball hoop`, `rim` en `ping pong ball` worden aanvaard, maar gebruik voor dit project exact de namen uit de YAML. In de live GUI is basketbal oranje, de pingpongbal cyaan, de voorspelling blauw en het spoor rood.
 
 ## Kwaliteitscontrole voordat je verder bouwt
 

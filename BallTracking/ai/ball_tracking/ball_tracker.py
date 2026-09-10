@@ -104,9 +104,23 @@ def _normalise_class_name(name):
     return str(name).lower().replace("_", " ").strip()
 
 
+BALL_STYLES = {
+    "ball": ("SPORTS BALL", "sports_ball", (0, 255, 0)),
+    "sports ball": ("SPORTS BALL", "sports_ball", (0, 255, 0)),
+    "basketball": ("BASKETBALL", "basketball", (0, 140, 255)),
+    "ping pong ball": ("WHITE PINGPONG", "ping_pong", (255, 255, 0)),
+    "white ping pong ball": ("WHITE PINGPONG", "ping_pong", (255, 255, 0)),
+}
+
+
+def ball_style(name):
+    """Return label, type and BGR display colour for supported ball classes."""
+    return BALL_STYLES.get(_normalise_class_name(name))
+
+
 def is_ball_class(name):
     """Return true only for a ball itself, not e.g. a baseball bat/glove."""
-    return _normalise_class_name(name) in {"ball", "sports ball", "basketball"}
+    return ball_style(name) is not None
 
 
 def is_hoop_class(name):
@@ -254,6 +268,9 @@ class BallTracker:
         # Prediction made immediately before the latest candidate selection.
         # It is kept for the live overlay without advancing the filter again.
         self.last_prediction = None
+        self.current_ball_kind = None
+        self.current_ball_label = None
+        self.current_ball_color = None
 
     @staticmethod
     def _init_kalman():
@@ -343,6 +360,9 @@ class BallTracker:
 
         self._correct(*best["center"])
         self.missed_frames = 0
+        self.current_ball_kind = best.get("kind", "sports_ball")
+        self.current_ball_label = best.get("label", "BALL")
+        self.current_ball_color = best.get("color", (0, 255, 0))
 
         entry = (best["center"], frame_count, best["w"], best["h"], best["conf"])
         self.positions.append(entry)
@@ -376,6 +396,9 @@ class BallTracker:
         self.kalman = self._init_kalman()
         self.kalman_initialized = False
         self.last_prediction = None
+        self.current_ball_kind = None
+        self.current_ball_label = None
+        self.current_ball_color = None
 
 
 # ============================================================================
@@ -489,6 +512,7 @@ class ShotDetector:
                     center = (int(x1 + w / 2), int(y1 + h / 2))
 
                     if is_ball_class(name):
+                        label, kind, color = ball_style(name)
                         required_conf = (
                             CONFIDENCE_BALL_IN_REGION
                             if in_hoop_region(center, self.hoop_pos)
@@ -502,6 +526,9 @@ class ShotDetector:
                                     "h": h,
                                     "conf": conf,
                                     "box": (x1, y1, x2, y2),
+                                    "label": label,
+                                    "kind": kind,
+                                    "color": color,
                                 }
                             )
 
@@ -550,14 +577,15 @@ class ShotDetector:
         # threshold. They make it clear what the detector saw this frame.
         for candidate in candidates:
             x1, y1, x2, y2 = candidate["box"]
-            cv2.rectangle(self.frame, (x1, y1), (x2, y2), (0, 165, 255), 1)
+            color = candidate.get("color", (0, 165, 255))
+            cv2.rectangle(self.frame, (x1, y1), (x2, y2), color, 1)
             cv2.putText(
                 self.frame,
-                f"YOLO candidate {candidate['conf']:.0%}",
+                f"YOLO {candidate.get('label', 'BALL')} {candidate['conf']:.0%}",
                 (x1, max(y1 - 8, 18)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.45,
-                (0, 165, 255),
+                color,
                 1,
             )
 
@@ -572,18 +600,21 @@ class ShotDetector:
             cv2.putText(self.frame, "prediction", (px + 10, py - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 180, 0), 1)
 
-        # Green is the one candidate accepted by the shape/movement checks.
+        # The bold class colour is the one candidate accepted by the
+        # shape/movement checks.
         if accepted is not None:
             (x, y), _, width, height, confidence = accepted
             x1, y1 = int(x - width / 2), int(y - height / 2)
             x2, y2 = int(x + width / 2), int(y + height / 2)
-            cv2.rectangle(self.frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
-            cv2.drawMarker(self.frame, (int(x), int(y)), (0, 255, 0),
+            color = self.ball_tracker.current_ball_color or (0, 255, 0)
+            label = self.ball_tracker.current_ball_label or "BALL"
+            cv2.rectangle(self.frame, (x1, y1), (x2, y2), color, 3)
+            cv2.drawMarker(self.frame, (int(x), int(y)), color,
                            markerType=cv2.MARKER_TILTED_CROSS,
                            markerSize=16, thickness=2)
-            cv2.putText(self.frame, f"TRACKED BALL {confidence:.0%}",
+            cv2.putText(self.frame, f"TRACKED {label} {confidence:.0%}",
                         (x1, max(y1 - 28, 18)), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.55, (0, 255, 0), 2)
+                        0.55, color, 2)
         elif candidates:
             cv2.putText(self.frame, "Candidates rejected by tracker", (50, 80),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
@@ -610,6 +641,10 @@ class ShotDetector:
         trajectory = self.ball_tracker.get_smoothed_trajectory()
 
         if len(self.hoop_pos) < 1 or len(trajectory) < 1:
+            return
+
+        # A pingpong ball is a tracking test object, not a basketball shot.
+        if self.ball_tracker.current_ball_kind == "ping_pong":
             return
 
         if not self.up:
@@ -639,18 +674,28 @@ class ShotDetector:
                     print(f"MISS! ({self.makes}/{self.attempts})")
 
     def display_score(self, fps):
-        text = f"{self.makes} / {self.attempts}"
-        cv2.putText(self.frame, text, (50, 125), cv2.FONT_HERSHEY_SIMPLEX,
-                    3, (255, 255, 255), 6)
-        cv2.putText(self.frame, text, (50, 125), cv2.FONT_HERSHEY_SIMPLEX,
-                    3, (0, 0, 0), 3)
+        frame_height, frame_width = self.frame.shape[:2]
+        panel_right = min(frame_width - 20, 760)
+        panel = self.frame.copy()
+        cv2.rectangle(panel, (20, 18), (panel_right, 158), (20, 20, 20), -1)
+        self.frame = cv2.addWeighted(panel, 0.72, self.frame, 0.28, 0)
 
-        status_text = (
-            f"FPS: {fps:.1f} | Ball track len: {len(self.ball_tracker.positions)} "
-            f"| Missed: {self.ball_tracker.missed_frames} | Hoops: {len(self.hoop_pos)}"
+        cv2.putText(self.frame, "BOUNZ VISION", (42, 48),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 220, 255), 2)
+        cv2.putText(self.frame, f"{self.makes} / {self.attempts}", (42, 120),
+                    cv2.FONT_HERSHEY_SIMPLEX, 2.0, (255, 255, 255), 3)
+        cv2.putText(self.frame, "MAKES / ATTEMPTS", (44, 145),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (190, 190, 190), 1)
+
+        status = (
+            f"FPS {fps:.1f}   TRACK {len(self.ball_tracker.positions)}   "
+            f"MISSED {self.ball_tracker.missed_frames}   HOOPS {len(self.hoop_pos)}"
         )
-        cv2.putText(self.frame, status_text, (50, 50), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7, (255, 255, 255), 2)
+        cv2.putText(self.frame, status, (285, 85), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.52, (255, 255, 255), 1)
+        legend_y = min(frame_height - 24, 190)
+        cv2.putText(self.frame, "ORANGE basketball  |  CYAN pingpong  |  BLUE prediction  |  RED trail",
+                    (42, legend_y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (235, 235, 235), 1)
 
         if self.fade_counter > 0:
             alpha = 0.2 * (self.fade_counter / self.fade_frames)
