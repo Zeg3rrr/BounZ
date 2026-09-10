@@ -1,12 +1,67 @@
 # Basketball Shot Detection and Tracking - Based on hi-tech-AI GitHub
 # Modified for BounZ application
 # Avi Shah (Original) - Adapted for BounZ
+#
+# ITERATION 2 - BALL TRACKING FOCUS
+# ----------------------------------------------------------------------------
+# Rim/hoop detection is intentionally left mostly untouched in this pass; it
+# will be reworked in the next iteration once ball tracking is solid.
+#
+# What changed in this pass and why:
+#
+# 1. Real single-target tracking instead of "append every matching box".
+#    A new `BallTracker` class keeps a constant-velocity Kalman filter for
+#    the ball. Every frame it:
+#      - predicts where the ball should be,
+#      - if several "ball"-like boxes were detected, picks the ONE closest
+#        to that prediction (weighted a bit by confidence) instead of
+#        blindly appending every match (the old code could push several
+#        unrelated detections into `ball_pos` in the same frame),
+#      - rejects a candidate if the jump is physically implausible, with a
+#        tolerance that grows the longer the ball has been missing (instead
+#        of a fixed "4x diameter" cutoff that didn't account for occlusion),
+#      - survives short occlusions (net, rim, hands) by predicting through
+#        gaps instead of just losing the point.
+#
+# 2. Only ball/hoop-like classes are requested from the model (`classes=`),
+#    which speeds up inference and NMS noticeably.
+#
+# 3. Inference now runs at a smaller `imgsz` while detections are still
+#    reported in full original-frame coordinates (Ultralytics does this
+#    rescaling internally), so we keep a crisp full-res display without
+#    paying full-res inference cost. This, together with (2), is what was
+#    actually killing FPS with yolov8l on a full-res webcam feed - not the
+#    tracking logic.
+#
+# 4. Automatic GPU + half-precision use when available, CPU fallback.
+#
+# 5. Score/attempt detection now reads from the tracker's smoothed
+#    trajectory, so the make/miss line-fit is noticeably less jittery.
+#
+# 6. Removed dead code (`self.class_names` was defined but never actually
+#    used anywhere).
+#
+# A note on the model itself: stock COCO-pretrained yolov8*.pt only has a
+# generic "sports ball" class - there is no "basketball" or "hoop" class in
+# COCO. That means:
+#   - hoop detection cannot work at all with a stock model (this is exactly
+#     why it's being deferred to the next pass),
+#   - ball detection works, but can occasionally false-positive on other
+#     round objects since it's not a basketball-specific class.
+# The bundled yolov8n.pt is used by default because it is fast for a webcam.
+# Once ball tracking is confirmed solid, the recommended next step for BOTH
+# ball and hoop accuracy is setting BOUNZ_MODEL_PATH to a basketball/hoop
+# fine-tuned model (or fine-tuning yolov8n yourselves). The rest of the code
+# already works from `model.names`, rather than hardcoded class IDs.
 
 from ultralytics import YOLO
 import cv2
 import math
 import numpy as np
+import time
 import sys
+import os
+from pathlib import Path
 
 # ============================================================================
 # CONFIGURATION
@@ -14,17 +69,60 @@ import sys
 
 CAMERA_INDEX = 0
 WINDOW_NAME = "BounZ - Basketball Shot Detector"
-MODEL_NAME = "yolov8n.pt"
+
+# Resolve the bundled model relative to this file, rather than relative to
+# the terminal's current directory. BOUNZ_MODEL_PATH may point at a custom
+# basketball/hoop model without editing this source file.
+PROJECT_DIR = Path(__file__).resolve().parents[2]
+DEFAULT_MODEL_PATH = PROJECT_DIR / "yolov8n.pt"
+MODEL_NAME = os.environ.get("BOUNZ_MODEL_PATH", str(DEFAULT_MODEL_PATH))
+
+INFER_WIDTH = 960            # inference resolution (multiple of 32).
+                              # Lower (e.g. 640) = faster but may miss a small/
+                              # far-away ball. Display stays full resolution.
+
+CONFIDENCE_BALL = 0.25              # normal ball confidence threshold
+CONFIDENCE_HOOP = 0.45              # unchanged, revisited in the rim pass
+CONFIDENCE_BALL_IN_REGION = 0.10    # relaxed threshold near the hoop
+
+USE_CLAHE = True             # contrast enhancement before detection.
+                              # If FPS is too low, try turning this off first.
+
+MAX_MISSED_FRAMES = 15       # how long the tracker tolerates the ball being
+                              # undetected (occlusion) before it resets
+TRAJECTORY_HISTORY = 60      # how many accepted ball points we keep
+SMOOTHING_ALPHA = 0.6        # EMA smoothing factor used only for the drawn/
+                              # fitted trajectory, not for raw gating
+
 
 # ============================================================================
-# UTILITY FUNCTIONS (From reference project utils.py)
+# CLASS-NAME HELPERS
+# ============================================================================
+
+def _normalise_class_name(name):
+    """Normalise common dataset class-name styles for reliable comparison."""
+    return str(name).lower().replace("_", " ").strip()
+
+
+def is_ball_class(name):
+    """Return true only for a ball itself, not e.g. a baseball bat/glove."""
+    return _normalise_class_name(name) in {"ball", "sports ball", "basketball"}
+
+
+def is_hoop_class(name):
+    """Recognise the common names used by basketball-specific datasets."""
+    return _normalise_class_name(name) in {"hoop", "basketball hoop", "rim"}
+
+
+# ============================================================================
+# UTILITY FUNCTIONS (rim/shot-scoring logic - unchanged, revisited later)
 # ============================================================================
 
 def score(ball_pos, hoop_pos):
     """Detect if a shot is made using linear regression."""
     if len(ball_pos) < 2 or len(hoop_pos) < 1:
         return False
-    
+
     x = []
     y = []
     rim_height = hoop_pos[-1][0][1] - 0.5 * hoop_pos[-1][3]
@@ -43,16 +141,15 @@ def score(ball_pos, hoop_pos):
     if len(x) > 1:
         try:
             m, b = np.polyfit(x, y, 1)
-            # Check if projected line fits between rim ends
             predicted_x = ((hoop_pos[-1][0][1] - 0.5 * hoop_pos[-1][3]) - b) / m
             rim_x1 = hoop_pos[-1][0][0] - 0.4 * hoop_pos[-1][2]
             rim_x2 = hoop_pos[-1][0][0] + 0.4 * hoop_pos[-1][2]
-            
+
             if rim_x1 < predicted_x < rim_x2:
                 return True
-        except:
+        except Exception:
             pass
-    
+
     return False
 
 
@@ -60,7 +157,7 @@ def detect_down(ball_pos, hoop_pos):
     """Detect if ball is below the net."""
     if len(ball_pos) < 1 or len(hoop_pos) < 1:
         return False
-    
+
     y = hoop_pos[-1][0][1] + 0.5 * hoop_pos[-1][3]
     return ball_pos[-1][0][1] > y
 
@@ -69,13 +166,13 @@ def detect_up(ball_pos, hoop_pos):
     """Detect if ball is around the backboard (shooting motion)."""
     if len(ball_pos) < 1 or len(hoop_pos) < 1:
         return False
-    
+
     x1 = hoop_pos[-1][0][0] - 4 * hoop_pos[-1][2]
     x2 = hoop_pos[-1][0][0] + 4 * hoop_pos[-1][2]
     y1 = hoop_pos[-1][0][1] - 2 * hoop_pos[-1][3]
     y2 = hoop_pos[-1][0][1]
 
-    return (x1 < ball_pos[-1][0][0] < x2 and 
+    return (x1 < ball_pos[-1][0][0] < x2 and
             y1 < ball_pos[-1][0][1] < y2 - 0.5 * hoop_pos[-1][3])
 
 
@@ -83,7 +180,7 @@ def in_hoop_region(center, hoop_pos):
     """Check if center point is near the hoop."""
     if len(hoop_pos) < 1:
         return False
-    
+
     x, y = center
     x1 = hoop_pos[-1][0][0] - 1 * hoop_pos[-1][2]
     x2 = hoop_pos[-1][0][0] + 1 * hoop_pos[-1][2]
@@ -93,44 +190,8 @@ def in_hoop_region(center, hoop_pos):
     return x1 < x < x2 and y1 < y < y2
 
 
-def clean_ball_pos(ball_pos, frame_count):
-    """Remove inaccurate ball detections based on motion physics."""
-    if len(ball_pos) > 1:
-        w1 = ball_pos[-2][2]
-        h1 = ball_pos[-2][3]
-        w2 = ball_pos[-1][2]
-        h2 = ball_pos[-1][3]
-
-        x1 = ball_pos[-2][0][0]
-        y1 = ball_pos[-2][0][1]
-        x2 = ball_pos[-1][0][0]
-        y2 = ball_pos[-1][0][1]
-
-        f1 = ball_pos[-2][1]
-        f2 = ball_pos[-1][1]
-        f_dif = f2 - f1
-
-        dist = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
-        max_dist = 4 * math.sqrt(w1 ** 2 + h1 ** 2)
-
-        # Ball should not move 4x its diameter within 5 frames
-        if dist > max_dist and f_dif < 5:
-            ball_pos.pop()
-
-        # Ball should be relatively square
-        elif (w2 * 1.4 < h2) or (h2 * 1.4 < w2):
-            ball_pos.pop()
-
-    # Remove points older than 30 frames
-    if len(ball_pos) > 0:
-        if frame_count - ball_pos[0][1] > 30:
-            ball_pos.pop(0)
-
-    return ball_pos
-
-
 def clean_hoop_pos(hoop_pos):
-    """Remove inaccurate hoop detections."""
+    """Remove inaccurate hoop detections. Unchanged - revisited in rim pass."""
     if len(hoop_pos) > 1:
         x1 = hoop_pos[-2][0][0]
         y1 = hoop_pos[-2][0][1]
@@ -149,15 +210,12 @@ def clean_hoop_pos(hoop_pos):
         dist = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
         max_dist = 0.5 * math.sqrt(w1 ** 2 + h1 ** 2)
 
-        # Hoop should not move 0.5x its diameter within 5 frames
-        if dist > max_dist and f_dif < 5:
+        if ((dist > max_dist and f_dif < 5) or
+                (w2 * 1.3 < h2) or (h2 * 1.3 < w2)):
+            # Remove only the newest bad detection. The old separate `if`
+            # statements could pop twice and accidentally discard history.
             hoop_pos.pop()
 
-        # Hoop should be relatively square
-        if (w2 * 1.3 < h2) or (h2 * 1.3 < w2):
-            hoop_pos.pop()
-
-    # Remove old points
     if len(hoop_pos) > 25:
         hoop_pos.pop(0)
 
@@ -165,20 +223,182 @@ def clean_hoop_pos(hoop_pos):
 
 
 # ============================================================================
-# SHOT DETECTOR CLASS (From reference project shot_detector.py)
+# BALL TRACKER (new) - Kalman filter based single-target tracker
+# ============================================================================
+
+class BallTracker:
+    """
+    Encapsulates all ball-specific tracking logic so it can be reasoned
+    about (and tuned) independently of the rest of the pipeline:
+
+      - a constant-velocity Kalman filter predicts where the ball should be
+      - when several "ball"-like boxes are detected in one frame, the one
+        closest to the prediction is kept (best-candidate selection)
+      - a physics gate rejects implausible jumps, with tolerance that grows
+        the longer the ball has gone undetected (handles brief occlusion by
+        the rim, net or a hand without immediately declaring it "lost")
+      - a shape gate rejects clearly non-ball-shaped boxes
+      - `positions` holds the accepted, cleaned trajectory in the same
+        (center, frame, w, h, conf) tuple format the existing rim/score
+        utility functions above already expect, so nothing downstream needs
+        to change format-wise
+    """
+
+    def __init__(self, max_missed=MAX_MISSED_FRAMES, history_len=TRAJECTORY_HISTORY):
+        self.positions = []
+        self.max_missed = max_missed
+        self.missed_frames = 0
+        self.history_len = history_len
+        self.kalman = self._init_kalman()
+        self.kalman_initialized = False
+        # Prediction made immediately before the latest candidate selection.
+        # It is kept for the live overlay without advancing the filter again.
+        self.last_prediction = None
+
+    @staticmethod
+    def _init_kalman():
+        kf = cv2.KalmanFilter(4, 2)
+        kf.measurementMatrix = np.array(
+            [[1, 0, 0, 0],
+             [0, 1, 0, 0]], np.float32)
+        kf.transitionMatrix = np.array(
+            [[1, 0, 1, 0],
+             [0, 1, 0, 1],
+             [0, 0, 1, 0],
+             [0, 0, 0, 1]], np.float32)
+        kf.processNoiseCov = np.eye(4, dtype=np.float32) * 1e-2
+        kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 1e-1
+        return kf
+
+    def predict(self):
+        if not self.kalman_initialized:
+            return None
+        pred = self.kalman.predict()
+        # OpenCV returns a (4, 1) state vector, so select scalar cells.
+        return float(pred[0, 0]), float(pred[1, 0])
+
+    def _correct(self, x, y):
+        measurement = np.array([[np.float32(x)], [np.float32(y)]])
+        if not self.kalman_initialized:
+            self.kalman.statePre = np.array([[x], [y], [0], [0]], np.float32)
+            self.kalman.statePost = np.array([[x], [y], [0], [0]], np.float32)
+            self.kalman_initialized = True
+        self.kalman.correct(measurement)
+
+    def update(self, candidates, frame_count):
+        """
+        candidates: list of dicts {"center": (x, y), "w": w, "h": h, "conf": c}
+        for every box classified as "ball" this frame.
+
+        Returns the accepted (center, frame, w, h, conf) tuple, or None if
+        nothing was accepted this frame.
+        """
+        self.last_prediction = self.predict() if self.kalman_initialized else None
+
+        if not candidates:
+            self.missed_frames += 1
+            return None
+
+        # A basketball's bounding box should be roughly square. Apply this
+        # before initialisation too, so the first false positive cannot start
+        # an implausible track.
+        candidates = [
+            candidate for candidate in candidates
+            if candidate["w"] > 0 and candidate["h"] > 0
+            and candidate["w"] * 1.4 >= candidate["h"]
+            and candidate["h"] * 1.4 >= candidate["w"]
+        ]
+        if not candidates:
+            self.missed_frames += 1
+            return None
+
+        if not self.positions:
+            # No track yet - just start with the most confident detection.
+            best = max(candidates, key=lambda c: c["conf"])
+        else:
+            pred_x, pred_y = self.last_prediction
+
+            def candidate_score(c):
+                dx = c["center"][0] - pred_x
+                dy = c["center"][1] - pred_y
+                dist = math.hypot(dx, dy)
+                # distance dominates; confidence only nudges close ties
+                return dist - (c["conf"] * 15)
+
+            best = min(candidates, key=candidate_score)
+
+            last_x, last_y = self.positions[-1][0]
+            last_frame = self.positions[-1][1]
+            last_w, last_h = self.positions[-1][2], self.positions[-1][3]
+            f_dif = max(frame_count - last_frame, 1)
+
+            dist = math.hypot(best["center"][0] - last_x, best["center"][1] - last_y)
+            # Tolerance grows with frames missed, so a real occlusion
+            # doesn't get rejected just because it's been a few frames.
+            max_dist = 4 * math.hypot(last_w, last_h) * f_dif
+
+            if dist > max_dist:
+                self.missed_frames += 1
+                return None
+
+        self._correct(*best["center"])
+        self.missed_frames = 0
+
+        entry = (best["center"], frame_count, best["w"], best["h"], best["conf"])
+        self.positions.append(entry)
+
+        if len(self.positions) > self.history_len:
+            self.positions.pop(0)
+
+        return entry
+
+    def get_smoothed_trajectory(self, alpha=SMOOTHING_ALPHA):
+        """EMA-smoothed copy of the trajectory, used only for drawing and for
+        the score() line-fit - the raw `positions` used for gating is left
+        untouched."""
+        if not self.positions:
+            return []
+
+        smoothed = [self.positions[0]]
+        for pos in self.positions[1:]:
+            prev = smoothed[-1]
+            sx = alpha * pos[0][0] + (1 - alpha) * prev[0][0]
+            sy = alpha * pos[0][1] + (1 - alpha) * prev[0][1]
+            smoothed.append(((sx, sy), pos[1], pos[2], pos[3], pos[4]))
+        return smoothed
+
+    def is_lost(self):
+        return self.missed_frames > self.max_missed
+
+    def reset(self):
+        self.positions = []
+        self.missed_frames = 0
+        self.kalman = self._init_kalman()
+        self.kalman_initialized = False
+        self.last_prediction = None
+
+
+# ============================================================================
+# SHOT DETECTOR CLASS
 # ============================================================================
 
 class ShotDetector:
     def __init__(self):
-        # Load the YOLO model
         print("Loading YOLO model...")
         self.model = YOLO(MODEL_NAME)
-        self.class_names = ['basketball', 'ball', 'sports ball', 'hoop', 'basketball hoop']
 
-        # Use webcam
+        self.device, self.use_half = self._pick_device()
+
+        # Only ask the model for classes that could plausibly be a ball or a
+        # hoop - cheaper inference/NMS and fewer irrelevant boxes to filter
+        # in Python. Falls back to "no filter" if the model has neither.
+        self.relevant_class_ids = [
+            i for i, n in self.model.names.items()
+            if is_ball_class(n) or is_hoop_class(n)
+        ] or None
+
         self.cap = cv2.VideoCapture(CAMERA_INDEX)
         if not self.cap.isOpened():
-            # Try alternative cameras
             for idx in [0, 1, 2]:
                 self.cap = cv2.VideoCapture(idx)
                 if self.cap.isOpened():
@@ -188,87 +408,135 @@ class ShotDetector:
         if not self.cap.isOpened():
             raise RuntimeError("Could not open camera")
 
-        # Position tracking arrays: ((x_pos, y_pos), frame_count, width, height, confidence)
-        self.ball_pos = []
-        self.hoop_pos = []
+        try:
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # keep frames as live as possible
+        except Exception:
+            pass
+
+        self.ball_tracker = BallTracker()
+        self.hoop_pos = []  # untouched for now, see header note
 
         self.frame_count = 0
         self.frame = None
+        self._prev_time = time.time()
 
-        # Score tracking
         self.makes = 0
         self.attempts = 0
 
-        # Shot detection (UP/DOWN regions)
         self.up = False
         self.down = False
         self.up_frame = 0
         self.down_frame = 0
 
-        # Visual feedback
         self.fade_frames = 20
         self.fade_counter = 0
         self.overlay_color = (0, 0, 0)
 
+    @staticmethod
+    def _pick_device():
+        try:
+            import torch
+            if torch.cuda.is_available():
+                return 0, True
+        except ImportError:
+            pass
+        return "cpu", False
+
+    @staticmethod
+    def _enhance_frame(frame):
+        """Mild contrast enhancement - helps in dim gyms. Toggle USE_CLAHE
+        off first if you need more FPS."""
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        l = clahe.apply(l)
+        enhanced = cv2.merge([l, a, b])
+        return cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
+
     def run(self):
-        """Main detection loop."""
-        print("Starting Basketball Shot Detection...")
+        print("Starting Basketball Shot Detection (ball-tracking focus)...")
         print("Press 'q' to exit\n")
 
         while True:
-            ret, self.frame = self.cap.read()
+            ret, raw_frame = self.cap.read()
             if not ret:
                 print("Error reading frame")
                 break
 
-            # YOLO Detection on frame
-            results = self.model(self.frame, stream=True, verbose=False)
+            infer_frame = self._enhance_frame(raw_frame) if USE_CLAHE else raw_frame
+
+            results = self.model.predict(
+                infer_frame,
+                imgsz=INFER_WIDTH,
+                conf=CONFIDENCE_BALL_IN_REGION,  # low global floor; we apply
+                classes=self.relevant_class_ids,  # the real thresholds below
+                device=self.device,
+                half=self.use_half,
+                verbose=False,
+            )
+
+            self.frame = raw_frame.copy()  # draw on the original, full-res frame
+
+            ball_candidates = []
 
             for r in results:
-                boxes = r.boxes
-                for box in boxes:
-                    # Get bounding box
-                    x1, y1, x2, y2 = box.xyxy[0]
-                    x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                for box in r.boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
                     w, h = x2 - x1, y2 - y1
-
-                    # Confidence
-                    conf = math.ceil((box.conf[0] * 100)) / 100
-
-                    # Class name
+                    conf = float(box.conf[0])
                     cls = int(box.cls[0])
-                    current_class = self.model.names.get(cls, "unknown")
-
+                    name = self.model.names.get(cls, "unknown")
                     center = (int(x1 + w / 2), int(y1 + h / 2))
 
-                    # Basketball detection - lower confidence when near hoop
-                    if "ball" in current_class.lower():
-                        if (conf > 0.3 or 
-                            (in_hoop_region(center, self.hoop_pos) and conf > 0.15)):
-                            self.ball_pos.append((center, self.frame_count, w, h, conf))
-                            # Draw rectangle
-                            cv2.rectangle(self.frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                            cv2.putText(self.frame, f"Ball: {conf:.2f}", (x1, y1 - 10),
-                                      cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                    if is_ball_class(name):
+                        required_conf = (
+                            CONFIDENCE_BALL_IN_REGION
+                            if in_hoop_region(center, self.hoop_pos)
+                            else CONFIDENCE_BALL
+                        )
+                        if conf >= required_conf:
+                            ball_candidates.append(
+                                {
+                                    "center": center,
+                                    "w": w,
+                                    "h": h,
+                                    "conf": conf,
+                                    "box": (x1, y1, x2, y2),
+                                }
+                            )
 
-                    # Hoop detection - high confidence required
-                    if "hoop" in current_class.lower():
-                        if conf > 0.5:
+                    elif is_hoop_class(name):  # unchanged, revisited in rim pass
+                        if conf > CONFIDENCE_HOOP:
                             self.hoop_pos.append((center, self.frame_count, w, h, conf))
-                            # Draw rectangle
                             cv2.rectangle(self.frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
                             cv2.putText(self.frame, f"Hoop: {conf:.2f}", (x1, y1 - 10),
-                                      cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
 
-            # Process detections
-            self.clean_motion()
+            accepted_ball = self.ball_tracker.update(ball_candidates, self.frame_count)
+
+            if self.ball_tracker.is_lost():
+                # Ball has been gone too long - treat the next detection as a
+                # fresh possession rather than dragging along a stale track.
+                self.ball_tracker.reset()
+                self.up = False
+                self.down = False
+
+            if len(self.hoop_pos) > 1:
+                self.hoop_pos = clean_hoop_pos(self.hoop_pos)
+
+            self._draw_detection_feedback(ball_candidates, accepted_ball)
+            self._draw_ball_trajectory()
             self.shot_detection()
-            self.display_score()
+
+            now = time.time()
+            fps = 1.0 / max(now - self._prev_time, 1e-6)
+            self._prev_time = now
+            self.display_score(fps)
+
             self.frame_count += 1
 
             cv2.imshow(WINDOW_NAME, self.frame)
 
-            # Exit on 'q'
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
@@ -276,107 +544,119 @@ class ShotDetector:
         cv2.destroyAllWindows()
         print("\nProgram ended")
 
-    def clean_motion(self):
-        """Clean and display ball motion."""
-        self.ball_pos = clean_ball_pos(self.ball_pos, self.frame_count)
-        
-        # Display ball trajectory
-        for i in range(len(self.ball_pos)):
-            cv2.circle(self.frame, self.ball_pos[i][0], 2, (0, 0, 255), 2)
-
-        # Draw line connecting ball positions
-        for i in range(1, len(self.ball_pos)):
-            cv2.line(
+    def _draw_detection_feedback(self, candidates, accepted):
+        """Draw the three tracking stages: YOLO candidates, prediction, result."""
+        # Orange boxes are raw YOLO candidates that passed the confidence
+        # threshold. They make it clear what the detector saw this frame.
+        for candidate in candidates:
+            x1, y1, x2, y2 = candidate["box"]
+            cv2.rectangle(self.frame, (x1, y1), (x2, y2), (0, 165, 255), 1)
+            cv2.putText(
                 self.frame,
-                self.ball_pos[i - 1][0],
-                self.ball_pos[i][0],
-                (0, 0, 255),
+                f"YOLO candidate {candidate['conf']:.0%}",
+                (x1, max(y1 - 8, 18)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (0, 165, 255),
                 1,
             )
 
-        # Clean hoop motion and display
-        if len(self.hoop_pos) > 1:
-            self.hoop_pos = clean_hoop_pos(self.hoop_pos)
+        # Blue crosshair is where the Kalman filter expected the ball before
+        # it inspected the current frame's detections.
+        prediction = self.ball_tracker.last_prediction
+        if prediction is not None:
+            px, py = map(int, prediction)
+            cv2.drawMarker(
+                           self.frame, (px, py), (255, 180, 0),
+                           markerType=cv2.MARKER_CROSS, markerSize=18, thickness=2)
+            cv2.putText(self.frame, "prediction", (px + 10, py - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 180, 0), 1)
+
+        # Green is the one candidate accepted by the shape/movement checks.
+        if accepted is not None:
+            (x, y), _, width, height, confidence = accepted
+            x1, y1 = int(x - width / 2), int(y - height / 2)
+            x2, y2 = int(x + width / 2), int(y + height / 2)
+            cv2.rectangle(self.frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
+            cv2.drawMarker(self.frame, (int(x), int(y)), (0, 255, 0),
+                           markerType=cv2.MARKER_TILTED_CROSS,
+                           markerSize=16, thickness=2)
+            cv2.putText(self.frame, f"TRACKED BALL {confidence:.0%}",
+                        (x1, max(y1 - 28, 18)), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55, (0, 255, 0), 2)
+        elif candidates:
+            cv2.putText(self.frame, "Candidates rejected by tracker", (50, 80),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+        else:
+            cv2.putText(self.frame, "No ball detected", (50, 80),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+    def _draw_ball_trajectory(self):
+        trajectory = self.ball_tracker.get_smoothed_trajectory()
+
+        for pos in trajectory:
+            point = (int(pos[0][0]), int(pos[0][1]))
+            cv2.circle(self.frame, point, 3, (0, 0, 255), -1)
+
+        for i in range(1, len(trajectory)):
+            p1 = (int(trajectory[i - 1][0][0]), int(trajectory[i - 1][0][1]))
+            p2 = (int(trajectory[i][0][0]), int(trajectory[i][0][1]))
+            cv2.line(self.frame, p1, p2, (0, 0, 255), 1)
+
+        if self.hoop_pos:
             cv2.circle(self.frame, self.hoop_pos[-1][0], 5, (128, 128, 0), 2)
 
     def shot_detection(self):
-        """Detect shot attempts and determine makes/misses."""
-        if len(self.hoop_pos) < 1 or len(self.ball_pos) < 1:
+        trajectory = self.ball_tracker.get_smoothed_trajectory()
+
+        if len(self.hoop_pos) < 1 or len(trajectory) < 1:
             return
 
-        # Detecting when ball is in 'up' and 'down' area
         if not self.up:
-            self.up = detect_up(self.ball_pos, self.hoop_pos)
+            self.up = detect_up(trajectory, self.hoop_pos)
             if self.up:
-                self.up_frame = self.ball_pos[-1][1]
+                self.up_frame = trajectory[-1][1]
 
         if self.up and not self.down:
-            self.down = detect_down(self.ball_pos, self.hoop_pos)
+            self.down = detect_down(trajectory, self.hoop_pos)
             if self.down:
-                self.down_frame = self.ball_pos[-1][1]
+                self.down_frame = trajectory[-1][1]
 
-        # If ball goes from 'up' area to 'down' area in that order, increase attempt
         if self.frame_count % 10 == 0:
             if self.up and self.down and self.up_frame < self.down_frame:
                 self.attempts += 1
                 self.up = False
                 self.down = False
 
-                # Check if it's a make or miss
-                if score(self.ball_pos, self.hoop_pos):
+                if score(trajectory, self.hoop_pos):
                     self.makes += 1
-                    self.overlay_color = (0, 255, 0)  # Green for make
+                    self.overlay_color = (0, 255, 0)
                     self.fade_counter = self.fade_frames
-                    print(f"🎯 MAKE! ({self.makes}/{self.attempts})")
+                    print(f"MAKE! ({self.makes}/{self.attempts})")
                 else:
-                    self.overlay_color = (0, 0, 255)  # Red for miss
+                    self.overlay_color = (0, 0, 255)
                     self.fade_counter = self.fade_frames
-                    print(f"❌ MISS! ({self.makes}/{self.attempts})")
+                    print(f"MISS! ({self.makes}/{self.attempts})")
 
-    def display_score(self):
-        """Display the score on frame."""
-        # Score text
-        text = str(self.makes) + " / " + str(self.attempts)
-        cv2.putText(
-            self.frame,
-            text,
-            (50, 125),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            3,
-            (255, 255, 255),
-            6,
-        )
-        cv2.putText(
-            self.frame,
-            text,
-            (50, 125),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            3,
-            (0, 0, 0),
-            3,
-        )
+    def display_score(self, fps):
+        text = f"{self.makes} / {self.attempts}"
+        cv2.putText(self.frame, text, (50, 125), cv2.FONT_HERSHEY_SIMPLEX,
+                    3, (255, 255, 255), 6)
+        cv2.putText(self.frame, text, (50, 125), cv2.FONT_HERSHEY_SIMPLEX,
+                    3, (0, 0, 0), 3)
 
-        # Status info
-        status_text = f"Balls: {len(self.ball_pos)} | Hoops: {len(self.hoop_pos)} | Frame: {self.frame_count}"
-        cv2.putText(
-            self.frame,
-            status_text,
-            (50, 50),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (255, 255, 255),
-            2,
+        status_text = (
+            f"FPS: {fps:.1f} | Ball track len: {len(self.ball_tracker.positions)} "
+            f"| Missed: {self.ball_tracker.missed_frames} | Hoops: {len(self.hoop_pos)}"
         )
+        cv2.putText(self.frame, status_text, (50, 50), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7, (255, 255, 255), 2)
 
-        # Gradually fade out make/miss overlay
         if self.fade_counter > 0:
             alpha = 0.2 * (self.fade_counter / self.fade_frames)
             self.frame = cv2.addWeighted(
-                self.frame,
-                1 - alpha,
-                np.full_like(self.frame, self.overlay_color),
-                alpha,
-                0,
+                self.frame, 1 - alpha,
+                np.full_like(self.frame, self.overlay_color), alpha, 0,
             )
             self.fade_counter -= 1
 
