@@ -62,7 +62,7 @@ Activeer vanuit de projectroot de virtuele omgeving en voer bijvoorbeeld uit:
   --every 15 --max-frames 300
 ```
 
-Bij 30 fps betekent `--every 15` ongeveer twee beelden per seconde. Gebruik voor elke clip een nieuwe uitvoermap. Bekijk de beelden en verwijder slechte of vrijwel identieke beelden voordat je gaat labelen.
+Bij 30 fps betekent `--every 15` ongeveer twee beelden per seconde. Gebruik voor elke clip een nieuwe uitvoermap. Het script zet de clipnaam voor iedere frame, zodat beelden uit verschillende clips later geen naamconflict hebben. Bekijk de beelden en verwijder slechte of vrijwel identieke beelden voordat je gaat labelen.
 
 ## 4. Label elke zichtbare bal en ring
 
@@ -98,7 +98,17 @@ Gebruik 70% trainen, 20% valideren en 10% testen als eerste verdeling:
   --output BallTracking\data\dataset
 ```
 
-De mappen `images/train`, `images/val`, `images/test` en bijhorende `labels/...` worden aangemaakt. Het script gebruikt steeds dezelfde seed en overschrijft nooit bestanden. Voor een eerlijke test plaats je beelden uit aparte clips in `test`, niet enkel willekeurig verdeelde frames.
+De mappen `images/train`, `images/val`, `images/test` en bijhorende `labels/...` worden aangemaakt. Het script gebruikt steeds dezelfde seed en overschrijft nooit bestanden. Voor een eerlijke test reserveer je een hele eigen clip met `--test-prefix`, bijvoorbeeld:
+
+```powershell
+.\.venv\Scripts\python.exe BallTracking\scripts\split_dataset.py `
+  --images BallTracking\data\annotated\images `
+  --labels BallTracking\data\annotated\labels `
+  --output BallTracking\data\dataset `
+  --test-prefix school_pingpong_test
+```
+
+Daarmee belanden alle bestanden die met `school_pingpong_test` beginnen uitsluitend in `test`; de overige beelden worden alleen over train en validatie verdeeld.
 
 ## 6. Train lokaal
 

@@ -19,6 +19,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train", type=float, default=0.70, help="Train share (default: 0.70)")
     parser.add_argument("--val", type=float, default=0.20, help="Validation share (default: 0.20)")
     parser.add_argument("--seed", type=int, default=42, help="Shuffle seed (default: 42)")
+    parser.add_argument(
+        "--test-prefix",
+        action="append",
+        default=[],
+        help="Filename prefix of a whole clip reserved for test; repeat if needed",
+    )
     return parser.parse_args()
 
 
@@ -47,10 +53,31 @@ def main() -> None:
     if len(images) < 10:
         raise SystemExit("Use at least 10 images before splitting a dataset")
 
-    random.Random(args.seed).shuffle(images)
-    train_end = round(len(images) * args.train)
-    val_end = train_end + round(len(images) * args.val)
-    splits = {"train": images[:train_end], "val": images[train_end:val_end], "test": images[val_end:]}
+    if args.test_prefix:
+        test_images = [
+            image for image in images
+            if any(image.name.startswith(prefix) for prefix in args.test_prefix)
+        ]
+        remaining_images = [image for image in images if image not in test_images]
+        if not test_images:
+            raise SystemExit("No images match --test-prefix")
+        random.Random(args.seed).shuffle(remaining_images)
+        train_share = args.train / (args.train + args.val)
+        train_end = round(len(remaining_images) * train_share)
+        splits = {
+            "train": remaining_images[:train_end],
+            "val": remaining_images[train_end:],
+            "test": test_images,
+        }
+    else:
+        random.Random(args.seed).shuffle(images)
+        train_end = round(len(images) * args.train)
+        val_end = train_end + round(len(images) * args.val)
+        splits = {
+            "train": images[:train_end],
+            "val": images[train_end:val_end],
+            "test": images[val_end:],
+        }
 
     for split, split_images in splits.items():
         for image in split_images:

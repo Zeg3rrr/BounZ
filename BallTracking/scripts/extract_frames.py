@@ -48,7 +48,10 @@ def main() -> None:
                 break
 
             if video_frame % args.every == 0:
-                target = args.output / f"frame_{saved:05d}.jpg"
+                # Prefix with the clip name so frames from different videos
+                # can later be placed in one annotation folder without name
+                # collisions.
+                target = args.output / f"{args.input.stem}_{saved:05d}.jpg"
                 if target.exists():
                     raise SystemExit(
                         f"Refusing to overwrite {target}. Choose an empty output folder."
