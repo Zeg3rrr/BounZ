@@ -61,13 +61,19 @@ import numpy as np
 import time
 import sys
 import os
+import threading
 from pathlib import Path
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 
-CAMERA_INDEX = 0
+# A Windows virtual webcam (Camo, DroidCam, ...) is selected either by its
+# DirectShow device name or by its numeric OpenCV index.  Environment variables
+# make this usable on another laptop without editing this file.
+CAMERA_INDEX = int(os.environ.get("BOUNZ_CAMERA_INDEX", "0"))
+CAMERA_NAME = os.environ.get("BOUNZ_CAMERA_NAME", "").strip()
+CAMERA_FALLBACK = os.environ.get("BOUNZ_CAMERA_FALLBACK", "1") == "1"
 WINDOW_NAME = "BounZ - Basketball Shot Detector"
 
 # Resolve the bundled model relative to this file, rather than relative to
@@ -77,16 +83,25 @@ PROJECT_DIR = Path(__file__).resolve().parents[2]
 DEFAULT_MODEL_PATH = PROJECT_DIR / "yolov8n.pt"
 MODEL_NAME = os.environ.get("BOUNZ_MODEL_PATH", str(DEFAULT_MODEL_PATH))
 
-INFER_WIDTH = 960            # inference resolution (multiple of 32).
-                              # Lower (e.g. 640) = faster but may miss a small/
-                              # far-away ball. Display stays full resolution.
+# Keep capture small enough for low latency.  The display uses this native
+# camera image; upscaling a 1080p webcam stream after a slow inference loop is
+# the main reason a live view looks delayed/"blurred" while moving.
+CAPTURE_WIDTH = int(os.environ.get("BOUNZ_CAMERA_WIDTH", "640"))
+CAPTURE_HEIGHT = int(os.environ.get("BOUNZ_CAMERA_HEIGHT", "480"))
+CAPTURE_FPS = int(os.environ.get("BOUNZ_CAMERA_FPS", "60"))
+
+INFER_WIDTH = int(os.environ.get("BOUNZ_INFER_WIDTH", "512"))
+                              # Must be a multiple of 32.  YOLO is only a
+                              # fallback for the white-pingpong tracker below.
+YOLO_EVERY_N_FRAMES = max(1, int(os.environ.get("BOUNZ_YOLO_EVERY", "3")))
 
 CONFIDENCE_BALL = 0.25              # normal ball confidence threshold
 CONFIDENCE_HOOP = 0.45              # unchanged, revisited in the rim pass
 CONFIDENCE_BALL_IN_REGION = 0.10    # relaxed threshold near the hoop
 
-USE_CLAHE = True             # contrast enhancement before detection.
-                              # If FPS is too low, try turning this off first.
+# CLAHE performs several full-frame colour conversions. It is disabled for
+# real-time use; enable it only in a very dark room with BOUNZ_USE_CLAHE=1.
+USE_CLAHE = os.environ.get("BOUNZ_USE_CLAHE", "0") == "1"
 
 MAX_MISSED_FRAMES = 15       # how long the tracker tolerates the ball being
                               # undetected (occlusion) before it resets
@@ -126,6 +141,110 @@ def is_ball_class(name):
 def is_hoop_class(name):
     """Recognise the common names used by basketball-specific datasets."""
     return _normalise_class_name(name) in {"hoop", "basketball hoop", "rim"}
+
+
+def find_white_pingpong_candidates(frame):
+    """Find small, bright, round objects without running the neural network.
+
+    COCO's ``sports ball`` model was not trained specifically on a small white
+    pingpong ball, and it can easily miss one while it is partly covered by a
+    hand.  This detector is deliberately cheap (threshold + contours), so it
+    can run on *every* camera frame.  The Kalman tracker below chooses the
+    candidate that continues the existing path, which prevents a white lamp or
+    wall detail from taking over an established track.
+    """
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    # White has very little saturation and a high value. The upper saturation
+    # limit still accepts a slightly warm/grey ball under indoor lighting.
+    mask = cv2.inRange(hsv, (0, 0, 165), (179, 95, 255))
+    kernel = np.ones((3, 3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    frame_h, frame_w = frame.shape[:2]
+    max_diameter = min(frame_w, frame_h) * 0.18
+    candidates = []
+
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < 18:
+            continue
+
+        x, y, w, h = cv2.boundingRect(contour)
+        if w < 4 or h < 4 or w > max_diameter or h > max_diameter:
+            continue
+
+        aspect = min(w, h) / max(w, h)
+        perimeter = cv2.arcLength(contour, True)
+        circularity = (4 * math.pi * area / (perimeter * perimeter)
+                       if perimeter > 0 else 0)
+        if aspect < 0.62 or circularity < 0.48:
+            continue
+
+        # A filled circular contour has area ~= pi/4 * bounding-box area.
+        # This rejects most slim bright reflections while preserving a ball
+        # whose edge is a little smeared by motion.
+        fill_ratio = area / max(w * h, 1)
+        if fill_ratio < 0.42:
+            continue
+
+        confidence = min(0.98, 0.58 + 0.24 * aspect + 0.18 * circularity)
+        candidates.append({
+            "center": (x + w // 2, y + h // 2),
+            "w": w,
+            "h": h,
+            "conf": confidence,
+            "box": (x, y, x + w, y + h),
+            "label": "WHITE PINGPONG",
+            "kind": "ping_pong",
+            "color": (255, 255, 0),
+            "source": "colour/circle",
+        })
+
+    return candidates
+
+
+class LatestFrameCapture:
+    """Continuously drain the webcam and expose only its newest frame.
+
+    Inference can take longer than the camera's frame interval. Reading in a
+    separate thread keeps old frames from accumulating in the driver queue,
+    so the image follows the hand instead of being several frames behind it.
+    """
+
+    def __init__(self, capture):
+        self.capture = capture
+        self._frame = None
+        self._sequence = 0
+        self._lock = threading.Lock()
+        self._stopped = threading.Event()
+        self._thread = threading.Thread(target=self._reader, daemon=True)
+
+    def start(self):
+        self._thread.start()
+        return self
+
+    def _reader(self):
+        while not self._stopped.is_set():
+            ok, frame = self.capture.read()
+            if not ok:
+                time.sleep(0.005)
+                continue
+            with self._lock:
+                self._frame = frame
+                self._sequence += 1
+
+    def read_latest(self):
+        with self._lock:
+            return (None if self._frame is None
+                    else (self._sequence, self._frame.copy()))
+
+    def close(self):
+        self._stopped.set()
+        self._thread.join(timeout=1.0)
+        self.capture.release()
 
 
 # ============================================================================
@@ -420,21 +539,23 @@ class ShotDetector:
             if is_ball_class(n) or is_hoop_class(n)
         ] or None
 
-        self.cap = cv2.VideoCapture(CAMERA_INDEX)
-        if not self.cap.isOpened():
-            for idx in [0, 1, 2]:
-                self.cap = cv2.VideoCapture(idx)
-                if self.cap.isOpened():
-                    print(f"Camera opened on index {idx}")
-                    break
-
-        if not self.cap.isOpened():
+        self.cap = self._open_camera()
+        if self.cap is None or not self.cap.isOpened():
             raise RuntimeError("Could not open camera")
 
-        try:
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # keep frames as live as possible
-        except Exception:
-            pass
+        # MJPG avoids expensive uncompressed USB frames on many Windows
+        # webcams. Drivers that do not support one of these properties simply
+        # ignore it, so this remains compatible with built-in cameras.
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_WIDTH)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_HEIGHT)
+        self.cap.set(cv2.CAP_PROP_FPS, CAPTURE_FPS)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        print("Camera: "
+              f"{int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x"
+              f"{int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))} @ "
+              f"{self.cap.get(cv2.CAP_PROP_FPS):.0f} FPS (requested)")
+        self.frame_source = LatestFrameCapture(self.cap).start()
 
         self.ball_tracker = BallTracker()
         self.hoop_pos = []  # untouched for now, see header note
@@ -442,6 +563,7 @@ class ShotDetector:
         self.frame_count = 0
         self.frame = None
         self._prev_time = time.time()
+        self._last_camera_sequence = -1
 
         self.makes = 0
         self.attempts = 0
@@ -454,6 +576,40 @@ class ShotDetector:
         self.fade_frames = 20
         self.fade_counter = 0
         self.overlay_color = (0, 0, 0)
+
+    @staticmethod
+    def _open_camera():
+        """Open a named virtual camera or an index via low-latency DirectShow.
+
+        Set ``BOUNZ_CAMERA_NAME=Camo`` when Camo is installed. If its exposed
+        name differs, use the index printed by ``camera_test.py`` instead. A
+        named camera deliberately does not fall back to the school webcam when
+        BOUNZ_CAMERA_FALLBACK=0, making configuration mistakes obvious.
+        """
+        if CAMERA_NAME:
+            print(f"Requesting camera by name: {CAMERA_NAME!r}")
+            cap = cv2.VideoCapture(f"video={CAMERA_NAME}", cv2.CAP_DSHOW)
+            if cap.isOpened():
+                print(f"Camera opened by name: {CAMERA_NAME!r}")
+                return cap
+            cap.release()
+            if not CAMERA_FALLBACK:
+                print("Requested camera was not available; webcam fallback is disabled.")
+                return None
+            print("Requested camera was not available; trying camera indices.")
+
+        indices = [CAMERA_INDEX] + [idx for idx in (0, 1, 2)
+                                    if idx != CAMERA_INDEX]
+        for idx in indices:
+            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                cap.release()
+                cap = cv2.VideoCapture(idx)
+            if cap.isOpened():
+                print(f"Camera opened on index {idx}")
+                return cap
+            cap.release()
+        return None
 
     @staticmethod
     def _pick_device():
@@ -481,63 +637,46 @@ class ShotDetector:
         print("Press 'q' to exit\n")
 
         while True:
-            ret, raw_frame = self.cap.read()
-            if not ret:
-                print("Error reading frame")
-                break
-
-            infer_frame = self._enhance_frame(raw_frame) if USE_CLAHE else raw_frame
-
-            results = self.model.predict(
-                infer_frame,
-                imgsz=INFER_WIDTH,
-                conf=CONFIDENCE_BALL_IN_REGION,  # low global floor; we apply
-                classes=self.relevant_class_ids,  # the real thresholds below
-                device=self.device,
-                half=self.use_half,
-                verbose=False,
-            )
+            latest = self.frame_source.read_latest()
+            if latest is None:
+                # The camera thread has not delivered its first frame yet.
+                time.sleep(0.002)
+                continue
+            sequence, raw_frame = latest
+            if sequence == self._last_camera_sequence:
+                # Do not run the Kalman filter repeatedly on one old frame:
+                # that would make its timing differ from the actual camera.
+                time.sleep(0.001)
+                continue
+            self._last_camera_sequence = sequence
 
             self.frame = raw_frame.copy()  # draw on the original, full-res frame
 
-            ball_candidates = []
+            # This inexpensive detector updates the pingpong position on every
+            # displayed frame, including the frames between YOLO inferences.
+            ball_candidates = find_white_pingpong_candidates(raw_frame)
 
-            for r in results:
-                for box in r.boxes:
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    w, h = x2 - x1, y2 - y1
-                    conf = float(box.conf[0])
-                    cls = int(box.cls[0])
-                    name = self.model.names.get(cls, "unknown")
-                    center = (int(x1 + w / 2), int(y1 + h / 2))
-
-                    if is_ball_class(name):
-                        label, kind, color = ball_style(name)
-                        required_conf = (
-                            CONFIDENCE_BALL_IN_REGION
-                            if in_hoop_region(center, self.hoop_pos)
-                            else CONFIDENCE_BALL
-                        )
-                        if conf >= required_conf:
-                            ball_candidates.append(
-                                {
-                                    "center": center,
-                                    "w": w,
-                                    "h": h,
-                                    "conf": conf,
-                                    "box": (x1, y1, x2, y2),
-                                    "label": label,
-                                    "kind": kind,
-                                    "color": color,
-                                }
-                            )
-
-                    elif is_hoop_class(name):  # unchanged, revisited in rim pass
-                        if conf > CONFIDENCE_HOOP:
-                            self.hoop_pos.append((center, self.frame_count, w, h, conf))
-                            cv2.rectangle(self.frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-                            cv2.putText(self.frame, f"Hoop: {conf:.2f}", (x1, y1 - 10),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+            # Generic YOLO remains useful for a basketball, or when the white
+            # ball is completely hidden by a hand. While a pingpong track is
+            # healthy, it is not needed at all: this is what lets the simple
+            # hand-held left/right test run at the camera's FPS on a CPU.
+            pingpong_track_is_healthy = (
+                self.ball_tracker.current_ball_kind == "ping_pong"
+                and self.ball_tracker.missed_frames <= 2
+            )
+            if (not pingpong_track_is_healthy
+                    and self.frame_count % YOLO_EVERY_N_FRAMES == 0):
+                infer_frame = self._enhance_frame(raw_frame) if USE_CLAHE else raw_frame
+                results = self.model.predict(
+                    infer_frame,
+                    imgsz=INFER_WIDTH,
+                    conf=CONFIDENCE_BALL_IN_REGION,
+                    classes=self.relevant_class_ids,
+                    device=self.device,
+                    half=self.use_half,
+                    verbose=False,
+                )
+                self._append_yolo_candidates(results, ball_candidates)
 
             accepted_ball = self.ball_tracker.update(ball_candidates, self.frame_count)
 
@@ -567,9 +706,46 @@ class ShotDetector:
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
-        self.cap.release()
+        self.frame_source.close()
         cv2.destroyAllWindows()
         print("\nProgram ended")
+
+    def _append_yolo_candidates(self, results, ball_candidates):
+        """Merge a periodic YOLO pass into the per-frame pingpong candidates."""
+        for result in results:
+            for box in result.boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                w, h = x2 - x1, y2 - y1
+                conf = float(box.conf[0])
+                cls = int(box.cls[0])
+                name = self.model.names.get(cls, "unknown")
+                center = (int(x1 + w / 2), int(y1 + h / 2))
+
+                if is_ball_class(name):
+                    label, kind, color = ball_style(name)
+                    required_conf = (
+                        CONFIDENCE_BALL_IN_REGION
+                        if in_hoop_region(center, self.hoop_pos)
+                        else CONFIDENCE_BALL
+                    )
+                    if conf >= required_conf:
+                        ball_candidates.append({
+                            "center": center,
+                            "w": w,
+                            "h": h,
+                            "conf": conf,
+                            "box": (x1, y1, x2, y2),
+                            "label": label,
+                            "kind": kind,
+                            "color": color,
+                            "source": "YOLO",
+                        })
+
+                elif is_hoop_class(name) and conf > CONFIDENCE_HOOP:
+                    self.hoop_pos.append((center, self.frame_count, w, h, conf))
+                    cv2.rectangle(self.frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+                    cv2.putText(self.frame, f"Hoop: {conf:.2f}", (x1, y1 - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
 
     def _draw_detection_feedback(self, candidates, accepted):
         """Draw the three tracking stages: YOLO candidates, prediction, result."""

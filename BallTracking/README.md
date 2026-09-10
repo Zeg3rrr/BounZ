@@ -68,13 +68,55 @@ The default camera index is:
 CAMERA_INDEX = 0
 ```
 
-If your webcam is not the default one, you can change it in the script or set another camera index in the code.
+If your webcam is not the default one, set another camera index for just the
+current PowerShell session. You do not need to edit the code:
+
+```powershell
+$env:BOUNZ_CAMERA_INDEX = "1"
+```
 
 Common values:
 
 - `0` = first webcam
 - `1` = second webcam
 - `2` = third webcam
+
+## iPhone camera (Camo or DroidCam)
+
+An iPhone is not directly a Windows webcam. First install and start a virtual
+webcam app such as Camo Studio on Windows and Camo Camera on the iPhone, then
+connect the iPhone 15 with a USB-C **data** cable and accept **Trust this
+computer** on the iPhone. USB is recommended for the lowest delay and keeps
+the phone charged.
+
+With Camo Studio open, discover the Windows camera index:
+
+```powershell
+python ai/ball_tracking/camera_test.py
+```
+
+Preview the result to make sure it is the iPhone image, for example:
+
+```powershell
+python ai/ball_tracking/camera_test.py --index 1
+```
+
+Close the preview with `Q`. Start BounZ using that same index:
+
+```powershell
+$env:BOUNZ_CAMERA_INDEX = "1"
+python ai/ball_tracking/ball_tracker.py
+```
+
+Alternatively, DirectShow virtual cameras can be selected by name. Camo often
+uses `Camo`; disabling fallback ensures BounZ does not silently switch back to
+the school webcam if the virtual camera is unavailable:
+
+```powershell
+$env:BOUNZ_CAMERA_NAME = "Camo"
+$env:BOUNZ_CAMERA_FALLBACK = "0"
+python ai/ball_tracking/ball_tracker.py
+```
 
 ## Run the program
 
@@ -85,6 +127,32 @@ python ai/ball_tracking/ball_tracker.py
 ```
 
 The program opens the webcam and shows the live detection view. Press `Q` to quit.
+
+### Snelle pingpongbal-test
+
+Voor een witte pingpongbal gebruikt de tracker naast YOLO ook een lichte
+kleur- en cirkeldetectie. Die draait op ieder camerabeeld, zodat de marker de
+bal ook volgt als je hem rustig in je hand van links naar rechts beweegt.
+
+De standaardinstelling vraagt de webcam om 640×480 op 60 FPS en draait YOLO
+hoogstens iedere drie beelden. Zodra een pingpongbal stabiel gevolgd wordt,
+draait alleen de snelle cirkeldetector tot de bal even kwijt is. Het programma
+houdt ondertussen alleen het meest recente camerabeeld bij; daardoor ontstaat
+er geen zichtbare wachtrij van oude, bewegingsonscherpe beelden.
+
+Als je camera een andere stand beter ondersteunt, kun je zonder codewijziging
+een PowerShell-sessie instellen, bijvoorbeeld:
+
+```powershell
+$env:BOUNZ_CAMERA_WIDTH = "1280"
+$env:BOUNZ_CAMERA_HEIGHT = "720"
+$env:BOUNZ_CAMERA_FPS = "30"
+$env:BOUNZ_YOLO_EVERY = "4"  # nog minder YOLO-belasting
+python ai/ball_tracking/ball_tracker.py
+```
+
+Meer licht op de bal helpt bij echte optische motion blur. Voor een donkere
+ruimte kun je eventueel `$env:BOUNZ_USE_CLAHE = "1"` zetten, maar dat kost FPS.
 
 ## What you should see on screen
 
